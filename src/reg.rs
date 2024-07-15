@@ -1,0 +1,27 @@
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum Register {
+    IdentificationModelId = 0xC0,
+    VhvConfigPadSclSdaExtsupHv = 0x89,
+    MsrcConfigControl = 0x60,
+    FinalRangeConfigMinCountRateRtnLimit = 0x44,
+    SystemSequenceConfig = 0x01,
+    DynamicSpadRefEnStartOffset = 0x4F,
+    DynamicSpadNumRequestedRefSpad = 0x4E,
+    GlobalConfigRefEnStartSelect = 0xB6,
+    SystemInterruptConfigGpio = 0x0A,
+    GpioHvMuxActiveHigh = 0x84,
+    SystemInterruptClear = 0x0B,
+    ResultInterruptStatus = 0x13,
+    SysrangeStart = 0x00,
+    GlobalConfigSpadEnablesRef0 = 0xB0,
+    ResultRangeStatus = 0x14,
+    FinalRangeConfigTimeoutMacropHi = 0x71,
+    MsrcConfigTimeoutMacrop = 0x46,
+    PreRangeConfigTimeoutMacropHi = 0x51,
+    PreRangeConfigVcselPeriod = 0x50,
+    FinalRangeConfigVcselPeriod = 0x70,
+    I2cSlaveDeviceAddress = 0x8A,
+    OscCalibrateVal = 0xF8,
+    SystemIntermeasurementPeriod = 0x04,
+}

@@ -1,0 +1,19 @@
+[package]
+name = "vl53l1x-simple"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A Rust driver for the VL53l1X TOF ranging sensor."
+homepage = "https://github.com/NZRosto/vl53l1x-simple"
+repository = "https://github.com/NZRosto/vl53l1x-simple"
+readme = "README.md"
+keywords = ["vl53l1x", "embedded", "embedded-hal", "no-std"]
+categories = ["embedded", "no-std", "no-std::no-alloc", "hardware-support"]
+
+
+[lints]
+clippy.pedantic = "warn"
+
+
+[dependencies]
+embedded-hal = "1"
