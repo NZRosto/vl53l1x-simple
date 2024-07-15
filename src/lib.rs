@@ -4,7 +4,7 @@
 mod imp;
 mod reg;
 
-/// The default I2C address for the VL53L0X.
+/// The default I2C address for the VL53L1X.
 pub const DEFAULT_ADDRESS: u8 = 0b010_1001;
 
 /// Possible errors that can occur during initialisation.
@@ -16,13 +16,11 @@ pub enum InitialisationError<EI2C, EX> {
     XShut(EX),
 
     /// The model ID read from the device was invalid.
-    InvalidModelId(u8),
-    /// The signal rate limit was invalid.
-    InvalidSignalRateLimit(f32),
-    /// The measurement timing budget was too short.
-    TimingBudgetTooShort,
-    /// The device timed out while calibrating.
-    CalibrationTimeout,
+    InvalidModelId(u16),
+    /// The device failed to boot within a reasonable time.
+    BootCompletionTimeout,
+    /// The timing budget was invalid.
+    InvalidTimingBudget,
 }
 
 /// A time source with millisecond precision.
@@ -31,23 +29,27 @@ pub trait ClockSource {
     fn get_ms(&self) -> u32;
 }
 
-/// A VL53L0X driver. Use the `new` function to create a new instance, then
+/// A VL53L1X driver. Use the `new` function to create a new instance, then
 /// call `range` to get the current range, if available.
-pub struct Vl53l0x<I2C, X> {
+pub struct Vl53l1x<I2C, X> {
     i2c: I2C,
     _x_shut: X,
     address: u8,
 
-    stop_variable: u8,
-    measurement_timing_budget_us: u32,
+    fast_osc_frequency: u16,
+    osc_calibrate_val: u16,
+    distance_mode: imp::DistanceMode,
+    calibrated: bool,
+    saved_vhv_init: u8,
+    saved_vhv_timeout: u8,
 }
 
-impl<I2C, X, EI2C, EX> Vl53l0x<I2C, X>
+impl<I2C, X, EI2C, EX> Vl53l1x<I2C, X>
 where
     I2C: embedded_hal::i2c::I2c<Error = EI2C>,
     X: embedded_hal::digital::OutputPin<Error = EX>,
 {
-    /// Create a new instance of the VL53L0X driver. This performs a reset of
+    /// Create a new instance of the VL53L1X driver. This performs a reset of
     /// the device and may fail if the device is not present. This will use the
     /// `x_shut` pin to select the device to be reset, then it will change that
     /// devices' address to the provided address.
@@ -87,8 +89,12 @@ where
             _x_shut: x_shut,
             address: DEFAULT_ADDRESS,
 
-            stop_variable: 0,
-            measurement_timing_budget_us: 0,
+            fast_osc_frequency: 0,
+            osc_calibrate_val: 0,
+            distance_mode: imp::DistanceMode::Long,
+            calibrated: false,
+            saved_vhv_init: 0,
+            saved_vhv_timeout: 0,
         };
 
         this.init(timer)?;
@@ -110,6 +116,6 @@ where
     /// # Errors
     /// Forwards any errors from the I2C bus.
     pub fn try_read(&mut self) -> Result<Option<u16>, EI2C> {
-        self.try_read_range_continuous_millimeters()
+        self.try_read_inner()
     }
 }

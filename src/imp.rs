@@ -1,659 +1,745 @@
-use crate::{reg::Register, ClockSource, InitialisationError, Vl53l0x};
+use crate::{reg::Register, ClockSource, InitialisationError, Vl53l1x};
 
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Default, Clone, Copy)]
-struct SequenceStepEnables {
-    tcc: bool,
-    msrc: bool,
-    dss: bool,
-    pre_range: bool,
-    final_range: bool,
+#[allow(dead_code)]
+pub(crate) enum DistanceMode {
+    Short,
+    Medium,
+    Long,
 }
 
-#[derive(Default, Clone, Copy)]
-struct SequenceStepTimeouts {
-    pre_range_vcsel_period_pclks: u16,
-    final_range_vcsel_period_pclks: u16,
-    msrc_dss_tcc_mclks: u16,
-    pre_range_mclks: u16,
-    final_range_mclks: u16,
-    msrc_dss_tcc_us: u32,
-    pre_range_us: u32,
-    final_range_us: u32,
+#[derive(Default)]
+struct ResultBuffer {
+    range_status: u8,
+    // uint8_t report_status: not used
+    stream_count: u8,
+    dss_actual_effective_spads_sd0: u16,
+    // uint16_t peak_signal_count_rate_mcps_sd0: not used
+    ambient_count_rate_mcps_sd0: u16,
+    // uint16_t sigma_sd0: not used
+    // uint16_t phase_sd0: not used
+    final_crosstalk_corrected_range_mm_sd0: u16,
+    peak_signal_count_rate_crosstalk_corrected_mcps_sd0: u16,
 }
 
-#[derive(Clone, Copy)]
-enum VcselPeriodType {
-    VcselPeriodPreRange,
-    VcselPeriodFinalRange,
+#[derive(Default)]
+#[repr(u8)]
+enum RangeStatus {
+    #[default]
+    RangeValid = 0,
+
+    // "sigma estimator check is above the internal defined threshold"
+    // (sigma = standard deviation of measurement)
+    SigmaFail = 1,
+
+    // "signal value is below the internal defined threshold"
+    SignalFail = 2,
+
+    // "Target is below minimum detection threshold."
+    RangeValidMinRangeClipped = 3,
+
+    // "phase is out of bounds"
+    // (nothing detected in range; try a longer distance mode if applicable)
+    OutOfBoundsFail = 4,
+
+    // "HW or VCSEL failure"
+    HardwareFail = 5,
+
+    // "The Range is valid but the wraparound check has not been done."
+    RangeValidNoWrapCheckFail = 6,
+
+    // "Wrapped target, not matching phases"
+    // "no matching phase in other VCSEL period timing."
+    WrapTargetFail = 7,
+
+    // "Internal algo underflow or overflow in lite ranging."
+    // ProcessingFail            =   8: not used in API
+
+    // "Specific to lite ranging."
+    // should never occur with this lib (which uses low power auto ranging,
+    // as the API does)
+    XtalkSignalFail = 9,
+
+    // "1st interrupt when starting ranging in back to back mode. Ignore
+    // data."
+    // should never occur with this lib
+    SynchronizationInt = 10, // (the API spells this "syncronisation")
+
+    // "All Range ok but object is result of multiple pulses merging together.
+    // Used by RQL for merged pulse detection"
+    // RangeValid MergedPulse    =  11: not used in API
+
+    // "Used by RQL as different to phase fail."
+    // TargetPresentLackOfSignal =  12:
+
+    // "Target is below minimum detection threshold."
+    MinRangeFail = 13,
+
+    // "The reported range is invalid"
+    // RangeInvalid              =  14: can't actually be returned by API (range can never become
+    // negative, even after correction)
+
+    // "No Update."
+    None = 255,
 }
 
-impl<I2C, X, EI2C, EX> Vl53l0x<I2C, X>
+#[derive(Default)]
+struct RangingData {
+    range_mm: u16,
+    range_status: RangeStatus,
+    peak_signal_count_rate_mcps: f32,
+    ambient_count_rate_mcps: f32,
+}
+
+const TARGET_RATE: u16 = 0x0A00;
+const TIMING_GUARD: u32 = 4528;
+
+impl<I2C, X, EI2C, EX> Vl53l1x<I2C, X>
 where
     I2C: embedded_hal::i2c::I2c<Error = EI2C>,
     X: embedded_hal::digital::OutputPin<Error = EX>,
 {
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn init(
         &mut self,
         timer: &impl ClockSource,
     ) -> Result<(), InitialisationError<EI2C, EX>> {
-        // check model ID register (value specified in datasheet)
+        // check model ID and module type registers (values specified in datasheet)
         let model_id = self
-            .read(Register::IdentificationModelId as u8)
+            .read_u16(Register::IdentificationModelId as u16)
             .map_err(InitialisationError::I2C)?;
-        if model_id != 0xEE {
+        if model_id != 0xEACC {
             return Err(InitialisationError::InvalidModelId(model_id));
         }
 
-        // sensor uses 1V8 mode for I/O by default; switch to 2V8 mode as it's default
-        // in the Arduino libraries
-        self.update(Register::VhvConfigPadSclSdaExtsupHv as u8, |data| {
-            *data |= 0x01;
-        })
-        .map_err(InitialisationError::I2C)?; // set bit 0
+        // VL53L1_software_reset() begin
 
-        // "Set I2C standard mode"
-        self.write(0x88, 0x00).map_err(InitialisationError::I2C)?;
-
-        self.write(0x80, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x00).map_err(InitialisationError::I2C)?;
-        self.stop_variable = self.read(0x91).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x80, 0x00).map_err(InitialisationError::I2C)?;
-
-        // disable SIGNAL_RATE_MSRC (bit 1) and SIGNAL_RATE_PRE_RANGE (bit 4) limit
-        // checks
-        self.update(Register::MsrcConfigControl as u8, |data| *data |= 0x12)
+        self.write(Register::SoftReset as u16, 0x00)
+            .map_err(InitialisationError::I2C)?;
+        {
+            let current_time = timer.get_ms();
+            while timer.get_ms() - current_time < 1 {}
+        }
+        self.write(Register::SoftReset as u16, 0x01)
             .map_err(InitialisationError::I2C)?;
 
-        // set final range signal rate limit to 0.25 MCPS (million counts per second)
-        self.set_signal_rate_limit(0.25)?;
+        // give it some time to boot; otherwise the sensor NACKs during the self.read()
+        // call below and the Arduino 101 doesn't seem to handle that well
+        {
+            let current_time = timer.get_ms();
+            while timer.get_ms() - current_time < 1 {}
+        }
 
-        self.write(Register::SystemSequenceConfig as u8, 0xFF)
-            .map_err(InitialisationError::I2C)?;
+        // VL53L1_poll_for_boot_completion() begin
 
-        // VL53L0X_DataInit() end
-
-        // VL53L0X_StaticInit() begin
-
-        let (spad_count, spad_type_is_aperture) = self.get_spad_info(timer)?;
-
-        // The SPAD map (RefGoodSpadMap) is read by VL53L0X_get_info_from_device() in
-        // the API, but the same data seems to be more easily readable from
-        // GLOBAL_CONFIG_SPAD_ENABLES_REF_0 through _6, so read it from there
-        let mut ref_spad_map = [0; 6];
-        self.read_many(
-            Register::GlobalConfigSpadEnablesRef0 as u8,
-            &mut ref_spad_map,
-        )
-        .map_err(InitialisationError::I2C)?;
-
-        // -- VL53L0X_set_reference_spads() begin (assume NVM values are valid)
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(Register::DynamicSpadRefEnStartOffset as u8, 0x00)
-            .map_err(InitialisationError::I2C)?;
-        self.write(Register::DynamicSpadNumRequestedRefSpad as u8, 0x2C)
-            .map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(Register::GlobalConfigRefEnStartSelect as u8, 0xB4)
-            .map_err(InitialisationError::I2C)?;
-
-        let first_spad_to_enable: u8 = if spad_type_is_aperture { 12 } else { 0 }; // 12 is the first aperture spad
-        let mut spads_enabled: u8 = 0;
-
-        for i in 0..48 {
-            if i < first_spad_to_enable || spads_enabled == spad_count {
-                // This bit is lower than the first one that should be enabled, or
-                // (reference_spad_count) bits have already been enabled, so zero this bit
-                ref_spad_map[(i / 8) as usize] &= !(1 << (i % 8));
-            } else if (ref_spad_map[(i / 8) as usize] >> (i % 8)) & 0x1 != 0 {
-                spads_enabled += 1;
+        // check last_status in case we still get a NACK to try to deal with it
+        // correctly
+        let current_time = timer.get_ms();
+        while (self
+            .read(Register::FirmwareSystemStatus as u16)
+            .map_err(InitialisationError::I2C)?
+            & 0x01)
+            == 0
+        {
+            if timer.get_ms() - current_time > 500 {
+                return Err(InitialisationError::BootCompletionTimeout);
             }
         }
 
-        self.write_many(Register::GlobalConfigSpadEnablesRef0 as u8, &ref_spad_map)
-            .map_err(InitialisationError::I2C)?;
+        // VL53L1_poll_for_boot_completion() end
 
-        // -- VL53L0X_set_reference_spads() end
+        // VL53L1_software_reset() end
 
-        // -- VL53L0X_load_tuning_settings() begin
-        // DefaultTuningSettings from vl53l0x_tuning.h
+        // VL53L1_DataInit() begin
 
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x00).map_err(InitialisationError::I2C)?;
+        // sensor uses 1V8 mode for I/O by default; switch to 2V8 mode as it's the
+        // default.
 
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x09, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x10, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x11, 0x00).map_err(InitialisationError::I2C)?;
-
-        self.write(0x24, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x25, 0xFF).map_err(InitialisationError::I2C)?;
-        self.write(0x75, 0x00).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x4E, 0x2C).map_err(InitialisationError::I2C)?;
-        self.write(0x48, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x30, 0x20).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x30, 0x09).map_err(InitialisationError::I2C)?;
-        self.write(0x54, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x31, 0x04).map_err(InitialisationError::I2C)?;
-        self.write(0x32, 0x03).map_err(InitialisationError::I2C)?;
-        self.write(0x40, 0x83).map_err(InitialisationError::I2C)?;
-        self.write(0x46, 0x25).map_err(InitialisationError::I2C)?;
-        self.write(0x60, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x27, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x50, 0x06).map_err(InitialisationError::I2C)?;
-        self.write(0x51, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x52, 0x96).map_err(InitialisationError::I2C)?;
-        self.write(0x56, 0x08).map_err(InitialisationError::I2C)?;
-        self.write(0x57, 0x30).map_err(InitialisationError::I2C)?;
-        self.write(0x61, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x62, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x64, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x65, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x66, 0xA0).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x22, 0x32).map_err(InitialisationError::I2C)?;
-        self.write(0x47, 0x14).map_err(InitialisationError::I2C)?;
-        self.write(0x49, 0xFF).map_err(InitialisationError::I2C)?;
-        self.write(0x4A, 0x00).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x7A, 0x0A).map_err(InitialisationError::I2C)?;
-        self.write(0x7B, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x78, 0x21).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x23, 0x34).map_err(InitialisationError::I2C)?;
-        self.write(0x42, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x44, 0xFF).map_err(InitialisationError::I2C)?;
-        self.write(0x45, 0x26).map_err(InitialisationError::I2C)?;
-        self.write(0x46, 0x05).map_err(InitialisationError::I2C)?;
-        self.write(0x40, 0x40).map_err(InitialisationError::I2C)?;
-        self.write(0x0E, 0x06).map_err(InitialisationError::I2C)?;
-        self.write(0x20, 0x1A).map_err(InitialisationError::I2C)?;
-        self.write(0x43, 0x40).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x34, 0x03).map_err(InitialisationError::I2C)?;
-        self.write(0x35, 0x44).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x31, 0x04).map_err(InitialisationError::I2C)?;
-        self.write(0x4B, 0x09).map_err(InitialisationError::I2C)?;
-        self.write(0x4C, 0x05).map_err(InitialisationError::I2C)?;
-        self.write(0x4D, 0x04).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x44, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x45, 0x20).map_err(InitialisationError::I2C)?;
-        self.write(0x47, 0x08).map_err(InitialisationError::I2C)?;
-        self.write(0x48, 0x28).map_err(InitialisationError::I2C)?;
-        self.write(0x67, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x70, 0x04).map_err(InitialisationError::I2C)?;
-        self.write(0x71, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x72, 0xFE).map_err(InitialisationError::I2C)?;
-        self.write(0x76, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x77, 0x00).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x0D, 0x01).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x80, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x01, 0xF8).map_err(InitialisationError::I2C)?;
-
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x8E, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x80, 0x00).map_err(InitialisationError::I2C)?;
-
-        // -- VL53L0X_load_tuning_settings() end
-
-        // "Set interrupt config to new sample ready"
-        // -- VL53L0X_SetGpioConfig() begin
-
-        self.write(Register::SystemInterruptConfigGpio as u8, 0x04)
-            .map_err(InitialisationError::I2C)?;
-        self.update(Register::GpioHvMuxActiveHigh as u8, |data| {
-            *data &= !0x10;
+        self.update(Register::PadI2cHvExtsupConfig as u16, |data| {
+            *data |= 0x01;
         })
-        .map_err(InitialisationError::I2C)?; // active low
-        self.write(Register::SystemInterruptClear as u8, 0x01)
+        .map_err(InitialisationError::I2C)?;
+
+        // store oscillator info for later use
+        self.fast_osc_frequency = self
+            .read_u16(Register::OscMeasuredFastOscFrequency as u16)
+            .map_err(InitialisationError::I2C)?;
+        self.osc_calibrate_val = self
+            .read_u16(Register::ResultOscCalibrateVal as u16)
             .map_err(InitialisationError::I2C)?;
 
-        // -- VL53L0X_SetGpioConfig() end
+        // VL53L1_DataInit() end
 
-        self.measurement_timing_budget_us = self
-            .get_measurement_timing_budget()
+        // VL53L1_StaticInit() begin
+
+        // Note that the API does not actually apply the configuration settings below
+        // when VL53L1_StaticInit() is called: it keeps a copy of the sensor's
+        // register contents in memory and doesn't actually write them until a
+        // measurement is started. Writing the configuration here means we don't have
+        // to keep it all in memory and avoids a lot of redundant writes later.
+
+        // the API sets the preset mode to LOWPOWER_AUTONOMOUS here:
+        // VL53L1_set_preset_mode() begin
+
+        // VL53L1_preset_mode_standard_ranging() begin
+
+        // values labeled "tuning parm default" are from vl53l1_tuning_parm_defaults.h
+        // (API uses these in VL53L1_init_tuning_parm_storage_struct())
+
+        self.write_u16(Register::DssConfigTargetTotalRateMcps as u16, TARGET_RATE)
+            .map_err(InitialisationError::I2C)?; // should already be this value after reset
+        self.write(Register::GpioTioHvStatus as u16, 0x02)
+            .map_err(InitialisationError::I2C)?;
+        self.write(Register::SigmaEstimatorEffectivePulseWidthNs as u16, 8)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
+        self.write(Register::SigmaEstimatorEffectiveAmbientWidthNs as u16, 16)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
+        self.write(
+            Register::AlgoCrosstalkCompensationValidHeightMm as u16,
+            0x01,
+        )
+        .map_err(InitialisationError::I2C)?;
+        self.write(Register::AlgoRangeIgnoreValidHeightMm as u16, 0xFF)
+            .map_err(InitialisationError::I2C)?;
+        self.write(Register::AlgoRangeMinClip as u16, 0)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
+        self.write(Register::AlgoConsistencyCheckTolerance as u16, 2)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
+
+        // general config
+        self.write_u16(Register::SystemThreshRateHighHi as u16, 0x0000)
+            .map_err(InitialisationError::I2C)?;
+        self.write_u16(Register::SystemThreshRateHighLo as u16, 0x0000)
+            .map_err(InitialisationError::I2C)?;
+        self.write(Register::DssConfigApertureAttenuation as u16, 0x38)
             .map_err(InitialisationError::I2C)?;
 
-        // "Disable MSRC and TCC by default"
-        // MSRC = Minimum Signal Rate Check
-        // TCC = Target CentreCheck
-        // -- VL53L0X_SetSequenceStepEnable() begin
+        // timing config
+        // most of these settings will be determined later by distance and timing
+        // budget configuration
+        self.write_u16(Register::RangeConfigSigmaThresh as u16, 360)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
+        self.write_u16(Register::RangeConfigMinCountRateRtnLimitMcps as u16, 192)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
 
-        self.write(Register::SystemSequenceConfig as u8, 0xE8)
+        // dynamic config
+
+        self.write(Register::SystemGroupedParameterHold0 as u16, 0x01)
             .map_err(InitialisationError::I2C)?;
-
-        // -- VL53L0X_SetSequenceStepEnable() end
-
-        // "Recalculate timing budget"
-        self.set_measurement_timing_budget(self.measurement_timing_budget_us)?;
-
-        // VL53L0X_StaticInit() end
-
-        // VL53L0X_PerformRefCalibration() begin (VL53L0X_perform_ref_calibration())
-
-        // -- VL53L0X_perform_vhv_calibration() begin
-
-        self.write(Register::SystemSequenceConfig as u8, 0x01)
+        self.write(Register::SystemGroupedParameterHold1 as u16, 0x01)
             .map_err(InitialisationError::I2C)?;
-        self.perform_single_ref_calibration(0x40, timer)?;
+        self.write(Register::SdConfigQuantifier as u16, 2)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
 
-        // -- VL53L0X_perform_vhv_calibration() end
+        // VL53L1_preset_mode_standard_ranging() end
 
-        // -- VL53L0X_perform_phase_calibration() begin
-
-        self.write(Register::SystemSequenceConfig as u8, 0x02)
+        // from VL53L1_preset_mode_timed_ranging_*
+        // GPH is 0 after reset, but writing GPH0 and GPH1 above seem to set GPH to 1,
+        // and things don't seem to work if we don't set GPH back to 0 (which the API
+        // does here).
+        self.write(Register::SystemGroupedParameterHold as u16, 0x00)
             .map_err(InitialisationError::I2C)?;
-        self.perform_single_ref_calibration(0x00, timer)?;
+        self.write(Register::SystemSeedConfig as u16, 1)
+            .map_err(InitialisationError::I2C)?; // tuning parm default
 
-        // -- VL53L0X_perform_phase_calibration() end
+        // from VL53L1_config_low_power_auto_mode
+        self.write(Register::SystemSequenceConfig as u16, 0x8B)
+            .map_err(InitialisationError::I2C)?; // VHV, PHASECAL, DSS1, RANGE
+        self.write_u16(
+            Register::DssConfigManualEffectiveSpadsSelect as u16,
+            200 << 8,
+        )
+        .map_err(InitialisationError::I2C)?;
+        self.write(Register::DssConfigRoiModeControl as u16, 2)
+            .map_err(InitialisationError::I2C)?; // REQUESTED_EFFFECTIVE_SPADS
 
-        // "restore the previous Sequence Config"
-        self.write(Register::SystemSequenceConfig as u8, 0xE8)
-            .map_err(InitialisationError::I2C)?;
+        // VL53L1_set_preset_mode() end
 
-        // VL53L0X_PerformRefCalibration() end
+        // default to long range, 50 ms timing budget
+        // note that this is different than what the API defaults to
+        self.set_distance_mode(DistanceMode::Long)?;
+        self.set_measurement_timing_budget(50000)?;
+
+        // VL53L1_StaticInit() end
+
+        // the API triggers this change in VL53L1_init_and_start_range() once a
+        // measurement is started; assumes MM1 and MM2 are disabled
+        let range_offset_mm = self
+            .read_u16(Register::MmConfigOuterOffsetMm as u16)
+            .map_err(InitialisationError::I2C)?
+            * 4;
+        self.write_u16(
+            Register::AlgoPartToPartRangeOffsetMm as u16,
+            range_offset_mm,
+        )
+        .map_err(InitialisationError::I2C)?;
 
         Ok(())
     }
 
     pub(crate) fn set_address(&mut self, new_addr: u8) -> Result<(), EI2C> {
-        self.write(Register::I2cSlaveDeviceAddress as u8, new_addr & 0x7F)?;
+        self.write(Register::I2cSlaveDeviceAddress as u16, new_addr & 0x7F)?;
         self.address = new_addr;
         Ok(())
     }
 
-    // Start continuous ranging measurements. If period_ms (optional) is 0 or not
-    // given, continuous back-to-back mode is used (the sensor takes measurements as
-    // often as possible); otherwise, continuous timed mode is used, with the given
-    // inter-measurement period in milliseconds determining how often the sensor
-    // takes a measurement.
-    // based on VL53L0X_StartMeasurement()
-    pub(crate) fn start_continuous(&mut self, mut period_ms: u32) -> Result<(), EI2C> {
-        self.write(0x80, 0x01)?;
-        self.write(0xFF, 0x01)?;
-        self.write(0x00, 0x00)?;
-        self.write(0x91, self.stop_variable)?;
-        self.write(0x00, 0x01)?;
-        self.write(0xFF, 0x00)?;
-        self.write(0x80, 0x00)?;
+    pub(crate) fn start_continuous(&mut self, period_ms: u32) -> Result<(), EI2C> {
+        // from VL53L1_set_inter_measurement_period_ms()
+        self.write_u32(
+            Register::SystemIntermeasurementPeriod as u16,
+            period_ms * u32::from(self.osc_calibrate_val),
+        )?;
 
-        if period_ms != 0 {
-            // continuous timed mode
-
-            // VL53L0X_SetInterMeasurementPeriodMilliSeconds() begin
-
-            let osc_calibrate_val: u16 = self.read_u16(Register::OscCalibrateVal as u8)?;
-
-            if osc_calibrate_val != 0 {
-                period_ms *= u32::from(osc_calibrate_val);
-            }
-
-            self.write_u32(Register::SystemIntermeasurementPeriod as u8, period_ms)?;
-
-            // VL53L0X_SetInterMeasurementPeriodMilliSeconds() end
-
-            self.write(Register::SysrangeStart as u8, 0x04)?; // VL53L0X_REG_SYSRANGE_MODE_TIMED
-        } else {
-            // continuous back-to-back mode
-            self.write(Register::SysrangeStart as u8, 0x02)?; // VL53L0X_REG_SYSRANGE_MODE_BACKTOBACK
-        }
+        self.write(Register::SystemInterruptClear as u16, 0x01)?; // sys_interrupt_clear_range
+        self.write(Register::SystemModeStart as u16, 0x40)?; // mode_range__timed
 
         Ok(())
     }
 
-    pub(crate) fn try_read_range_continuous_millimeters(&mut self) -> Result<Option<u16>, EI2C> {
-        #[allow(clippy::verbose_bit_mask)]
-        if (self.read(Register::ResultInterruptStatus as u8)? & 0x07) == 0 {
+    pub(crate) fn try_read_inner(&mut self) -> Result<Option<u16>, EI2C> {
+        if !self.data_ready()? {
             return Ok(None);
         }
 
-        // assumptions: Linearity Corrective Gain is 1000 (default);
-        // fractional ranging is not enabled
-        let range: u16 = self.read_u16(Register::ResultRangeStatus as u8 + 10)?;
+        let results = self.read_results()?;
 
-        self.write(Register::SystemInterruptClear as u8, 0x01)?;
-
-        Ok(Some(range))
-    }
-
-    // Set the return signal rate limit check value in units of MCPS (mega counts
-    // per second). "This represents the amplitude of the signal reflected from the
-    // target and detected by the device"; setting this limit presumably determines
-    // the minimum measurement necessary for the sensor to report a valid reading.
-    // Setting a lower limit increases the potential range of the sensor but also
-    // seems to increase the likelihood of getting an inaccurate reading because of
-    // unwanted reflections from objects other than the intended target.
-    // Defaults to 0.25 MCPS as initialized by the ST API and this library.
-    fn set_signal_rate_limit(
-        &mut self,
-        limit_mcps: f32,
-    ) -> Result<(), InitialisationError<EI2C, EX>> {
-        if !(0.0..=511.99).contains(&limit_mcps) {
-            return Err(InitialisationError::InvalidSignalRateLimit(limit_mcps));
+        if !self.calibrated {
+            self.setup_manual_calibration()?;
+            self.calibrated = true;
         }
 
-        // Q9.7 fixed point format (9 integer bits, 7 fractional bits)
-        //
-        // This is absolutely horrible, this couldn't have been written
-        // more confusingly by the API devs if they tried. Hopefully this works?.
-        // Just look at clippy complain...
-        #[allow(clippy::cast_possible_truncation)]
-        #[allow(clippy::cast_precision_loss)]
-        #[allow(clippy::cast_sign_loss)]
-        self.write_u16(
-            Register::FinalRangeConfigMinCountRateRtnLimit as u8,
-            (limit_mcps * ((1_u32 << 7_u32) as f32)) as u16,
-        )
-        .map_err(InitialisationError::I2C)
+        self.update_dss(&results)?;
+
+        let ranging_data = get_ranging_data(&results);
+
+        self.write(Register::SystemInterruptClear as u16, 0x01)?; // sys_interrupt_clear_range
+
+        Ok(Some(ranging_data.range_mm))
     }
 
-    fn get_spad_info(
-        &mut self,
-        timer: &impl ClockSource,
-    ) -> Result<(u8, bool), InitialisationError<EI2C, EX>> {
-        self.write(0x80, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x00).map_err(InitialisationError::I2C)?;
+    fn setup_manual_calibration(&mut self) -> Result<(), EI2C> {
+        // "save original vhv configs"
+        self.saved_vhv_init = self.read(Register::VhvConfigInit as u16)?;
+        self.saved_vhv_timeout = self.read(Register::VhvConfigTimeoutMacropLoopBound as u16)?;
 
-        self.write(0xFF, 0x06).map_err(InitialisationError::I2C)?;
-        self.update(0x83, |data| *data |= 0x04)
-            .map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x07).map_err(InitialisationError::I2C)?;
-        self.write(0x81, 0x01).map_err(InitialisationError::I2C)?;
+        // "disable VHV init"
+        self.write(Register::VhvConfigInit as u16, self.saved_vhv_init & 0x7F)?;
 
-        self.write(0x80, 0x01).map_err(InitialisationError::I2C)?;
+        // "set loop bound to tuning param"
+        self.write(
+            Register::VhvConfigTimeoutMacropLoopBound as u16,
+            (self.saved_vhv_timeout & 0x03) + (3 << 2),
+        )?; // tuning parm default (LOWPOWERAUTO_VHV_LOOP_BOUND_DEFAULT)
 
-        self.write(0x94, 0x6b).map_err(InitialisationError::I2C)?;
-        self.write(0x83, 0x00).map_err(InitialisationError::I2C)?;
-        let start_time: u32 = timer.get_ms();
-        while self.read(0x83).map_err(InitialisationError::I2C)? == 0x00 {
-            if (timer.get_ms() - start_time) > 500 {
-                // 500 ms
-                return Err(InitialisationError::CalibrationTimeout);
+        // "override phasecal"
+        self.write(Register::PhasecalConfigOverride as u16, 0x01)?;
+        let phasecal_result = self.read(Register::PhasecalResultVcselStart as u16)?;
+        self.write(Register::CalConfigVcselStart as u16, phasecal_result)?;
+
+        Ok(())
+    }
+
+    fn update_dss(&mut self, results: &ResultBuffer) -> Result<(), EI2C> {
+        let spad_count: u16 = results.dss_actual_effective_spads_sd0;
+
+        if spad_count != 0 {
+            // "Calc total rate per spad"
+
+            let mut total_rate_per_spad: u32 =
+                u32::from(results.peak_signal_count_rate_crosstalk_corrected_mcps_sd0)
+                    + u32::from(results.ambient_count_rate_mcps_sd0);
+
+            // "clip to 16 bits"
+            if total_rate_per_spad > 0xFFFF {
+                total_rate_per_spad = 0xFFFF;
+            }
+
+            // "shift up to take advantage of 32 bits"
+            total_rate_per_spad <<= 16;
+
+            total_rate_per_spad /= u32::from(spad_count);
+
+            if total_rate_per_spad != 0 {
+                // "get the target rate and shift up by 16"
+                let mut required_spads: u32 = (u32::from(TARGET_RATE) << 16) / total_rate_per_spad;
+
+                // "clip to 16 bit"
+                if required_spads > 0xFFFF {
+                    required_spads = 0xFFFF;
+                }
+
+                // "override DSS config"
+                #[allow(clippy::cast_possible_truncation)]
+                self.write_u16(
+                    Register::DssConfigManualEffectiveSpadsSelect as u16,
+                    required_spads as u16,
+                )?;
+                // DSS_CONFIG__ROI_MODE_CONTROL should already be set to
+                // REQUESTED_EFFFECTIVE_SPADS
+
+                return Ok(());
             }
         }
-        self.write(0x83, 0x01).map_err(InitialisationError::I2C)?;
-        let tmp = self.read(0x92).map_err(InitialisationError::I2C)?;
 
-        let count = tmp & 0x7f;
-        let type_is_aperture = ((tmp >> 7) & 0x01) != 0;
+        // If we reached this point, it means something above would have resulted in a
+        // divide by zero.
+        // "We want to gracefully set a spad target, not just exit with an error"
 
-        self.write(0x81, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x06).map_err(InitialisationError::I2C)?;
-        self.update(0x83, |data| *data &= !0x04)
+        // "set target to mid point"
+        self.write_u16(Register::DssConfigManualEffectiveSpadsSelect as u16, 0x8000)?;
+
+        Ok(())
+    }
+
+    fn data_ready(&mut self) -> Result<bool, EI2C> {
+        Ok((self.read(Register::GpioTioHvStatus as u16)? & 0x01) == 0)
+    }
+
+    fn read_results(&mut self) -> Result<ResultBuffer, EI2C> {
+        let mut results = ResultBuffer::default();
+
+        let mut data: [u8; 17] = [0; 17];
+        self.i2c.transaction(
+            self.address,
+            &mut [
+                embedded_hal::i2c::Operation::Write(&[
+                    (Register::ResultRangeStatus as u16 >> 8) as u8,
+                    Register::ResultRangeStatus as u8,
+                ]),
+                embedded_hal::i2c::Operation::Read(&mut data),
+            ],
+        )?;
+
+        results.range_status = data[0];
+        // results.range_status = bus.read();
+
+        _ = data[1];
+        // bus->read(); // report_status: not used
+
+        results.stream_count = data[2];
+        // results.stream_count = bus.read();
+
+        results.dss_actual_effective_spads_sd0 = u16::from(data[3]) << 8 | u16::from(data[4]);
+        // results.dss_actual_effective_spads_sd0  = (uint16_t)bus.read() << 8; // high
+        // byte results.dss_actual_effective_spads_sd0 |=           bus.read();
+        // // low byte
+
+        _ = data[5];
+        // bus.read(); // peak_signal_count_rate_mcps_sd0: not used
+        _ = data[6];
+        // bus.read();
+
+        results.ambient_count_rate_mcps_sd0 = u16::from(data[7]) << 8 | u16::from(data[8]);
+        // results.ambient_count_rate_mcps_sd0  = (uint16_t)bus.read() << 8; // high
+        // byte results.ambient_count_rate_mcps_sd0 |=           bus.read();
+        // // low byte
+
+        _ = data[9];
+        // bus.read(); // sigma_sd0: not used
+        _ = data[10];
+        // bus.read();
+
+        _ = data[11];
+        // bus.read(); // phase_sd0: not used
+        _ = data[12];
+        // bus.read();
+
+        results.final_crosstalk_corrected_range_mm_sd0 =
+            u16::from(data[13]) << 8 | u16::from(data[14]);
+        // results.final_crosstalk_corrected_range_mm_sd0  = (uint16_t)bus.read() << 8;
+        // // high byte results.final_crosstalk_corrected_range_mm_sd0 |=
+        // bus.read();      // low byte
+
+        results.peak_signal_count_rate_crosstalk_corrected_mcps_sd0 =
+            u16::from(data[15]) << 8 | u16::from(data[16]);
+        // results.peak_signal_count_rate_crosstalk_corrected_mcps_sd0  =
+        // (uint16_t)bus.read() << 8; // high byte
+        // results.peak_signal_count_rate_crosstalk_corrected_mcps_sd0 |=
+        // bus.read();      // low byte
+
+        Ok(results)
+    }
+
+    fn set_distance_mode(
+        &mut self,
+        mode: DistanceMode,
+    ) -> Result<(), InitialisationError<EI2C, EX>> {
+        // save existing timing budget
+        let budget_us: u32 = self
+            .get_measurement_timing_budget()
             .map_err(InitialisationError::I2C)?;
-        self.write(0xFF, 0x01).map_err(InitialisationError::I2C)?;
-        self.write(0x00, 0x01).map_err(InitialisationError::I2C)?;
 
-        self.write(0xFF, 0x00).map_err(InitialisationError::I2C)?;
-        self.write(0x80, 0x00).map_err(InitialisationError::I2C)?;
+        match mode {
+            DistanceMode::Short => {
+                // from VL53L1_preset_mode_standard_ranging_short_range()
 
-        Ok((count, type_is_aperture))
+                // timing config
+                self.write(Register::RangeConfigVcselPeriodA as u16, 0x07)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigVcselPeriodB as u16, 0x05)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigValidPhaseHigh as u16, 0x38)
+                    .map_err(InitialisationError::I2C)?;
+
+                // dynamic config
+                self.write(Register::SdConfigWoiSd0 as u16, 0x07)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigWoiSd1 as u16, 0x05)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigInitialPhaseSd0 as u16, 6)
+                    .map_err(InitialisationError::I2C)?; // tuning parm default
+                self.write(Register::SdConfigInitialPhaseSd1 as u16, 6)
+                    .map_err(InitialisationError::I2C)?; // tuning parm
+                                                         // default
+            }
+
+            DistanceMode::Medium => {
+                // from VL53L1_preset_mode_standard_ranging()
+
+                // timing config
+                self.write(Register::RangeConfigVcselPeriodA as u16, 0x0B)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigVcselPeriodB as u16, 0x09)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigValidPhaseHigh as u16, 0x78)
+                    .map_err(InitialisationError::I2C)?;
+
+                // dynamic config
+                self.write(Register::SdConfigWoiSd0 as u16, 0x0B)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigWoiSd1 as u16, 0x09)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigInitialPhaseSd0 as u16, 10)
+                    .map_err(InitialisationError::I2C)?; // tuning parm default
+                self.write(Register::SdConfigInitialPhaseSd1 as u16, 10)
+                    .map_err(InitialisationError::I2C)?; // tuning parm
+                                                         // default
+            }
+
+            DistanceMode::Long => {
+                // long
+                // from VL53L1_preset_mode_standard_ranging_long_range()
+
+                // timing config
+                self.write(Register::RangeConfigVcselPeriodA as u16, 0x0F)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigVcselPeriodB as u16, 0x0D)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::RangeConfigValidPhaseHigh as u16, 0xB8)
+                    .map_err(InitialisationError::I2C)?;
+
+                // dynamic config
+                self.write(Register::SdConfigWoiSd0 as u16, 0x0F)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigWoiSd1 as u16, 0x0D)
+                    .map_err(InitialisationError::I2C)?;
+                self.write(Register::SdConfigInitialPhaseSd0 as u16, 14)
+                    .map_err(InitialisationError::I2C)?; // tuning parm default
+                self.write(Register::SdConfigInitialPhaseSd1 as u16, 14)
+                    .map_err(InitialisationError::I2C)?; // tuning parm
+                                                         // default
+            }
+        }
+
+        // reapply timing budget
+        self.set_measurement_timing_budget(budget_us)?;
+
+        // save mode so it can be returned by getDistanceMode()
+        self.distance_mode = mode;
+
+        Ok(())
     }
 
     fn get_measurement_timing_budget(&mut self) -> Result<u32, EI2C> {
-        const START_OVERHEAD: u16 = 1910;
-        const END_OVERHEAD: u16 = 960;
-        const MSRC_OVERHEAD: u16 = 660;
-        const TCC_OVERHEAD: u16 = 590;
-        const DSS_OVERHEAD: u16 = 690;
-        const PRE_RANGE_OVERHEAD: u16 = 660;
-        const FINAL_RANGE_OVERHEAD: u16 = 550;
+        // assumes PresetMode is LOWPOWER_AUTONOMOUS and these sequence steps are
+        // enabled: VHV, PHASECAL, DSS1, RANGE
 
-        let mut enables: SequenceStepEnables = SequenceStepEnables::default();
-        let mut timeouts: SequenceStepTimeouts = SequenceStepTimeouts::default();
+        // VL53L1_get_timeouts_us() begin
 
-        // "Start and end overhead times always present"
-        let mut budget_us: u32 = u32::from(START_OVERHEAD) + u32::from(END_OVERHEAD);
+        // "Update Macro Period for Range A VCSEL Period"
+        let period = self.read(Register::RangeConfigVcselPeriodA as u16)?;
+        let macro_period_us: u32 = self.calc_macro_period(period);
 
-        self.get_sequence_step_enables(&mut enables)?;
-        self.get_sequence_step_timeouts(&mut timeouts, enables)?;
+        // "Get Range Timing A timeout"
 
-        if enables.tcc {
-            budget_us += timeouts.msrc_dss_tcc_us + u32::from(TCC_OVERHEAD);
-        }
+        let range_config_timeout_us: u32 = timeout_mclks_to_microseconds(
+            decode_timeout(self.read_u16(Register::RangeConfigTimeoutMacropA as u16)?),
+            macro_period_us,
+        );
 
-        if enables.dss {
-            budget_us += 2 * (timeouts.msrc_dss_tcc_us + u32::from(DSS_OVERHEAD));
-        } else if enables.msrc {
-            budget_us += timeouts.msrc_dss_tcc_us + u32::from(MSRC_OVERHEAD);
-        }
+        // VL53L1_get_timeouts_us() end
 
-        if enables.pre_range {
-            budget_us += timeouts.pre_range_us + u32::from(PRE_RANGE_OVERHEAD);
-        }
-
-        if enables.final_range {
-            budget_us += timeouts.final_range_us + u32::from(FINAL_RANGE_OVERHEAD);
-        }
-
-        self.measurement_timing_budget_us = budget_us; // store for internal reuse
-        Ok(budget_us)
+        Ok(2 * range_config_timeout_us + TIMING_GUARD)
     }
 
     fn set_measurement_timing_budget(
         &mut self,
-        budget_us: u32,
+        mut budget_us: u32,
     ) -> Result<(), InitialisationError<EI2C, EX>> {
-        const START_OVERHEAD: u16 = 1910;
-        const END_OVERHEAD: u16 = 960;
-        const MSRC_OVERHEAD: u16 = 660;
-        const TCC_OVERHEAD: u16 = 590;
-        const DSS_OVERHEAD: u16 = 690;
-        const PRE_RANGE_OVERHEAD: u16 = 660;
-        const FINAL_RANGE_OVERHEAD: u16 = 550;
+        // assumes PresetMode is LOWPOWER_AUTONOMOUS
 
-        let mut enables: SequenceStepEnables = SequenceStepEnables::default();
-        let mut timeouts: SequenceStepTimeouts = SequenceStepTimeouts::default();
+        if budget_us <= TIMING_GUARD {
+            return Err(InitialisationError::InvalidTimingBudget);
+        }
 
-        let mut used_budget_us: u32 = u32::from(START_OVERHEAD) + u32::from(END_OVERHEAD);
+        budget_us -= TIMING_GUARD;
+        let mut range_config_timeout_us: u32 = budget_us;
+        if range_config_timeout_us > 1_100_000 {
+            return Err(InitialisationError::InvalidTimingBudget);
+        } // FDA_MAX_TIMING_BUDGET_US * 2
 
-        self.get_sequence_step_enables(&mut enables)
+        range_config_timeout_us /= 2;
+
+        // VL53L1_calc_timeout_register_values() begin
+
+        let mut macro_period_us: u32;
+
+        // "Update Macro Period for Range A VCSEL Period"
+        let period = self
+            .read(Register::RangeConfigVcselPeriodA as u16)
             .map_err(InitialisationError::I2C)?;
-        self.get_sequence_step_timeouts(&mut timeouts, enables)
+        macro_period_us = self.calc_macro_period(period);
+
+        // "Update Phase timeout - uses Timing A"
+        // Timeout of 1000 is tuning parm default
+        // (TIMED_PHASECAL_CONFIG_TIMEOUT_US_DEFAULT)
+        // via VL53L1_get_preset_mode_timing_cfg().
+        let mut phasecal_timeout_mclks: u32 = timeout_microseconds_to_mclks(1000, macro_period_us);
+        if phasecal_timeout_mclks > 0xFF {
+            phasecal_timeout_mclks = 0xFF;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        self.write(
+            Register::PhasecalConfigTimeoutMacrop as u16,
+            phasecal_timeout_mclks as u8,
+        )
+        .map_err(InitialisationError::I2C)?;
+
+        // "Update MM Timing A timeout"
+        // Timeout of 1 is tuning parm default
+        // (LOWPOWERAUTO_MM_CONFIG_TIMEOUT_US_DEFAULT)
+        // via VL53L1_get_preset_mode_timing_cfg(). With the API, the register
+        // actually ends up with a slightly different value because it gets assigned,
+        // retrieved, recalculated with a different macro period, and reassigned,
+        // but it probably doesn't matter because it seems like the MM ("mode
+        // mitigation"?) sequence steps are disabled in low power auto mode anyway.
+        self.write_u16(
+            Register::MmConfigTimeoutMacropA as u16,
+            encode_timeout(timeout_microseconds_to_mclks(1, macro_period_us)),
+        )
+        .map_err(InitialisationError::I2C)?;
+
+        // "Update Range Timing A timeout"
+        self.write_u16(
+            Register::RangeConfigTimeoutMacropA as u16,
+            encode_timeout(timeout_microseconds_to_mclks(
+                range_config_timeout_us,
+                macro_period_us,
+            )),
+        )
+        .map_err(InitialisationError::I2C)?;
+
+        // "Update Macro Period for Range B VCSEL Period"
+        let period = self
+            .read(Register::RangeConfigVcselPeriodB as u16)
             .map_err(InitialisationError::I2C)?;
+        macro_period_us = self.calc_macro_period(period);
 
-        if enables.tcc {
-            used_budget_us += timeouts.msrc_dss_tcc_us + u32::from(TCC_OVERHEAD);
-        }
+        // "Update MM Timing B timeout"
+        // (See earlier comment about MM Timing A timeout.)
+        self.write_u16(
+            Register::MmConfigTimeoutMacropB as u16,
+            encode_timeout(timeout_microseconds_to_mclks(1, macro_period_us)),
+        )
+        .map_err(InitialisationError::I2C)?;
 
-        if enables.dss {
-            used_budget_us += 2 * (timeouts.msrc_dss_tcc_us + u32::from(DSS_OVERHEAD));
-        } else if enables.msrc {
-            used_budget_us += timeouts.msrc_dss_tcc_us + u32::from(MSRC_OVERHEAD);
-        }
+        // "Update Range Timing B timeout"
+        self.write_u16(
+            Register::RangeConfigTimeoutMacropB as u16,
+            encode_timeout(timeout_microseconds_to_mclks(
+                range_config_timeout_us,
+                macro_period_us,
+            )),
+        )
+        .map_err(InitialisationError::I2C)?;
 
-        if enables.pre_range {
-            used_budget_us += timeouts.pre_range_us + u32::from(PRE_RANGE_OVERHEAD);
-        }
-
-        if enables.final_range {
-            used_budget_us += u32::from(FINAL_RANGE_OVERHEAD);
-
-            // "Note that the final range timeout is determined by the timing
-            // budget and the sum of all other timeouts within the sequence.
-            // If there is no room for the final range timeout, then an error
-            // will be set. Otherwise the remaining time will be applied to
-            // the final range."
-
-            if used_budget_us > budget_us {
-                // "Requested timeout too big."
-                return Err(InitialisationError::TimingBudgetTooShort);
-            }
-
-            let final_range_timeout_us: u32 = budget_us - used_budget_us;
-
-            // set_sequence_step_timeout() begin
-            // (SequenceStepId == VL53L0X_SEQUENCESTEP_FINAL_RANGE)
-
-            // "For the final range timeout, the pre-range timeout
-            //  must be added. To do this both final and pre-range
-            //  timeouts must be expressed in macro periods MClks
-            //  because they have different vcsel periods."
-
-            let mut final_range_timeout_mclks: u32 = timeout_microseconds_to_mclks(
-                final_range_timeout_us,
-                timeouts.final_range_vcsel_period_pclks,
-            );
-
-            if enables.pre_range {
-                final_range_timeout_mclks += u32::from(timeouts.pre_range_mclks);
-            }
-
-            self.write_u16(
-                Register::FinalRangeConfigTimeoutMacropHi as u8,
-                encode_timeout(final_range_timeout_mclks),
-            )
-            .map_err(InitialisationError::I2C)?;
-
-            // set_sequence_step_timeout() end
-
-            self.measurement_timing_budget_us = budget_us; // store for internal
-                                                           // reuse
-        }
+        // VL53L1_calc_timeout_register_values() end
 
         Ok(())
     }
 
-    fn get_sequence_step_enables(&mut self, enables: &mut SequenceStepEnables) -> Result<(), EI2C> {
-        let sequence_config: u8 = self.read(Register::SystemSequenceConfig as u8)?;
+    // Calculate macro period in microseconds (12.12 format) with given VCSEL period
+    // assumes fast_osc_frequency has been read and stored
+    // based on VL53L1_calc_macro_period_us()
+    fn calc_macro_period(&self, vcsel_period: u8) -> u32 {
+        // from VL53L1_calc_pll_period_us()
+        // fast osc frequency in 4.12 format; PLL period in 0.24 format
+        let pll_period_us: u32 = (0x01 << 30) / u32::from(self.fast_osc_frequency);
 
-        enables.tcc = ((sequence_config >> 4) & 0x1) != 0;
-        enables.dss = ((sequence_config >> 3) & 0x1) != 0;
-        enables.msrc = ((sequence_config >> 2) & 0x1) != 0;
-        enables.pre_range = ((sequence_config >> 6) & 0x1) != 0;
-        enables.final_range = ((sequence_config >> 7) & 0x1) != 0;
+        // from VL53L1_decode_vcsel_period()
+        let vcsel_period_pclks: u8 = (vcsel_period + 1) << 1;
 
-        Ok(())
-    }
+        // VL53L1_MACRO_PERIOD_VCSEL_PERIODS = 2304
+        let mut macro_period_us: u32 = 2304_u32 * pll_period_us;
+        macro_period_us >>= 6;
+        macro_period_us *= u32::from(vcsel_period_pclks);
+        macro_period_us >>= 6;
 
-    fn get_sequence_step_timeouts(
-        &mut self,
-        timeouts: &mut SequenceStepTimeouts,
-        enables: SequenceStepEnables,
-    ) -> Result<(), EI2C> {
-        timeouts.pre_range_vcsel_period_pclks =
-            self.get_vcsel_pulse_period(VcselPeriodType::VcselPeriodPreRange)?;
-
-        timeouts.msrc_dss_tcc_mclks =
-            u16::from(self.read(Register::MsrcConfigTimeoutMacrop as u8)?) + 1;
-        timeouts.msrc_dss_tcc_us = timeout_mclks_to_microseconds(
-            timeouts.msrc_dss_tcc_mclks,
-            timeouts.pre_range_vcsel_period_pclks,
-        );
-
-        timeouts.pre_range_mclks =
-            decode_timeout(self.read_u16(Register::PreRangeConfigTimeoutMacropHi as u8)?);
-        timeouts.pre_range_us = timeout_mclks_to_microseconds(
-            timeouts.pre_range_mclks,
-            timeouts.pre_range_vcsel_period_pclks,
-        );
-
-        timeouts.final_range_vcsel_period_pclks =
-            self.get_vcsel_pulse_period(VcselPeriodType::VcselPeriodFinalRange)?;
-
-        timeouts.final_range_mclks =
-            decode_timeout(self.read_u16(Register::FinalRangeConfigTimeoutMacropHi as u8)?);
-
-        if enables.pre_range {
-            timeouts.final_range_mclks -= timeouts.pre_range_mclks;
-        }
-
-        timeouts.final_range_us = timeout_mclks_to_microseconds(
-            timeouts.final_range_mclks,
-            timeouts.final_range_vcsel_period_pclks,
-        );
-
-        Ok(())
-    }
-
-    fn get_vcsel_pulse_period(&mut self, period_type: VcselPeriodType) -> Result<u16, EI2C> {
-        Ok(match period_type {
-            VcselPeriodType::VcselPeriodPreRange => {
-                decode_vcsel_period(self.read(Register::PreRangeConfigVcselPeriod as u8)?).into()
-            }
-            VcselPeriodType::VcselPeriodFinalRange => {
-                decode_vcsel_period(self.read(Register::FinalRangeConfigVcselPeriod as u8)?).into()
-            }
-        })
-    }
-
-    fn perform_single_ref_calibration(
-        &mut self,
-        vhv_init_byte: u8,
-        timer: &impl ClockSource,
-    ) -> Result<(), InitialisationError<EI2C, EX>> {
-        self.write(Register::SysrangeStart as u8, 0x01 | vhv_init_byte)
-            .map_err(InitialisationError::I2C)?; // VL53L0X_REG_SYSRANGE_MODE_START_STOP
-
-        let start_time: u32 = timer.get_ms();
-        #[allow(clippy::verbose_bit_mask)]
-        while (self
-            .read(Register::ResultInterruptStatus as u8)
-            .map_err(InitialisationError::I2C)?
-            & 0x07)
-            == 0
-        {
-            if (timer.get_ms() - start_time) > 500 {
-                // 500 ms
-                return Err(InitialisationError::CalibrationTimeout);
-            }
-        }
-
-        self.write(Register::SystemInterruptClear as u8, 0x01)
-            .map_err(InitialisationError::I2C)?;
-
-        self.write(Register::SysrangeStart as u8, 0x00)
-            .map_err(InitialisationError::I2C)?;
-
-        Ok(())
+        macro_period_us
     }
 }
 
-impl<I2C, X, EI2C, EX> Vl53l0x<I2C, X>
+impl<I2C, X, EI2C, EX> Vl53l1x<I2C, X>
 where
     I2C: embedded_hal::i2c::I2c<Error = EI2C>,
     X: embedded_hal::digital::OutputPin<Error = EX>,
 {
-    fn write(&mut self, register: u8, data: u8) -> Result<(), EI2C> {
-        self.i2c.write(self.address, &[register, data])
+    fn read(&mut self, register: u16) -> Result<u8, EI2C> {
+        let mut data = [0];
+        #[allow(clippy::cast_possible_truncation)]
+        self.i2c.write_read(
+            self.address,
+            &[(register >> 8) as u8, register as u8],
+            &mut data,
+        )?;
+        Ok(data[0])
     }
 
-    fn write_u16(&mut self, register: u8, data: u16) -> Result<(), EI2C> {
+    fn read_u16(&mut self, register: u16) -> Result<u16, EI2C> {
+        let mut data = [0; 2];
+        #[allow(clippy::cast_possible_truncation)]
+        self.i2c.write_read(
+            self.address,
+            &[(register >> 8) as u8, register as u8],
+            &mut data,
+        )?;
+        Ok(u16::from(data[0]) << 8 | u16::from(data[1]))
+    }
+
+    fn write(&mut self, register: u16, data: u8) -> Result<(), EI2C> {
         #[allow(clippy::cast_possible_truncation)]
         self.i2c
-            .write(self.address, &[register, (data >> 8) as u8, data as u8])
+            .write(self.address, &[(register >> 8) as u8, register as u8, data])
     }
 
-    fn write_u32(&mut self, register: u8, data: u32) -> Result<(), EI2C> {
+    fn write_u16(&mut self, register: u16, data: u16) -> Result<(), EI2C> {
         #[allow(clippy::cast_possible_truncation)]
         self.i2c.write(
             self.address,
             &[
-                register,
+                (register >> 8) as u8,
+                register as u8,
+                (data >> 8) as u8,
+                data as u8,
+            ],
+        )
+    }
+
+    fn write_u32(&mut self, register: u16, data: u32) -> Result<(), EI2C> {
+        #[allow(clippy::cast_possible_truncation)]
+        self.i2c.write(
+            self.address,
+            &[
+                (register >> 8) as u8,
+                register as u8,
                 (data >> 24) as u8,
                 (data >> 16) as u8,
                 (data >> 8) as u8,
@@ -662,57 +748,39 @@ where
         )
     }
 
-    fn write_many(&mut self, register: u8, data: &[u8]) -> Result<(), EI2C> {
-        self.i2c.transaction(
+    fn update(&mut self, register: u16, f: impl FnOnce(&mut u8)) -> Result<(), EI2C> {
+        let mut data = [0];
+        #[allow(clippy::cast_possible_truncation)]
+        self.i2c.write_read(
             self.address,
-            &mut [
-                embedded_hal::i2c::Operation::Write(&[register]),
-                embedded_hal::i2c::Operation::Write(data),
-            ],
+            &[(register >> 8) as u8, register as u8],
+            &mut data,
+        )?;
+        f(&mut data[0]);
+        #[allow(clippy::cast_possible_truncation)]
+        self.i2c.write(
+            self.address,
+            &[(register >> 8) as u8, register as u8, data[0]],
         )
     }
-
-    fn read(&mut self, register: u8) -> Result<u8, EI2C> {
-        let mut data = [0];
-        self.i2c.write_read(self.address, &[register], &mut data)?;
-        Ok(data[0])
-    }
-
-    fn read_u16(&mut self, register: u8) -> Result<u16, EI2C> {
-        let mut data = [0; 2];
-        self.i2c.write_read(self.address, &[register], &mut data)?;
-        Ok(u16::from(data[0]) << 8 | u16::from(data[1]))
-    }
-
-    fn read_many(&mut self, register: u8, data: &mut [u8]) -> Result<(), EI2C> {
-        self.i2c.write_read(self.address, &[register], data)
-    }
-
-    fn update(&mut self, register: u8, f: impl FnOnce(&mut u8)) -> Result<(), EI2C> {
-        let mut data = [0];
-        self.i2c.write_read(self.address, &[register], &mut data)?;
-        f(&mut data[0]);
-        self.i2c.write(self.address, &[register, data[0]])
-    }
 }
 
-fn calc_macro_period(vcsel_period_pclks: u16) -> u32 {
-    ((2304 * u32::from(vcsel_period_pclks) * 1655) + 500) / 1000
+#[allow(clippy::cast_possible_truncation)]
+fn timeout_mclks_to_microseconds(timeout_mclks: u32, macro_period_us: u32) -> u32 {
+    ((u64::from(timeout_mclks) * u64::from(macro_period_us) + 0x800) >> 12) as u32
 }
 
-fn timeout_microseconds_to_mclks(timeout_period_us: u32, vcsel_period_pclks: u16) -> u32 {
-    let macro_period_ns: u32 = calc_macro_period(vcsel_period_pclks);
-
-    ((timeout_period_us * 1000) + (macro_period_ns / 2)) / macro_period_ns
+fn timeout_microseconds_to_mclks(timeout_us: u32, macro_period_us: u32) -> u32 {
+    ((timeout_us << 12) + (macro_period_us >> 1)) / macro_period_us
 }
 
-fn timeout_mclks_to_microseconds(timeout_period_mclks: u16, vcsel_period_pclks: u16) -> u32 {
-    let macro_period_ns: u32 = calc_macro_period(vcsel_period_pclks);
-
-    ((u32::from(timeout_period_mclks) * macro_period_ns) + 500) / 1000
+fn decode_timeout(reg_val: u16) -> u32 {
+    ((u32::from(reg_val & 0xFF)) << (reg_val >> 8)) + 1
 }
 
 fn encode_timeout(timeout_mclks: u32) -> u16 {
+    // encoded format: "(LSByte * 2^MSByte) + 1"
+
     let mut ls_byte: u32;
     let mut ms_byte: u16 = 0;
 
@@ -724,16 +792,105 @@ fn encode_timeout(timeout_mclks: u32) -> u16 {
             ms_byte += 1;
         }
 
-        (ms_byte << 8) | (ls_byte & 0xFF) as u16
+        (ms_byte << 8) | ((ls_byte & 0xFF) as u16)
     } else {
         0
     }
 }
 
-fn decode_timeout(reg_val: u16) -> u16 {
-    ((reg_val & 0x00FF) << ((reg_val & 0xFF00) >> 8)) + 1
+fn count_rate_fixed_to_float(count_rate_fixed: u16) -> f32 {
+    f32::from(count_rate_fixed) / f32::from(1_u16 << 7_u16)
 }
 
-fn decode_vcsel_period(reg_val: u8) -> u8 {
-    ((reg_val) + 1) << 1
+#[allow(clippy::cast_possible_truncation)]
+fn get_ranging_data(results: &ResultBuffer) -> RangingData {
+    let mut ranging_data = RangingData::default();
+    // VL53L1_copy_sys_and_core_results_to_range_results() begin
+
+    let range: u16 = results.final_crosstalk_corrected_range_mm_sd0;
+
+    // "apply correction gain"
+    // gain factor of 2011 is tuning parm default
+    // (VL53L1_TUNINGPARM_LITE_RANGING_GAIN_FACTOR_DEFAULT) Basically, this
+    // appears to scale the result by 2011/2048, or about 98% (with the 1024
+    // added for proper rounding).
+    ranging_data.range_mm = ((u32::from(range) * 2011 + 0x0400) / 0x0800) as u16;
+
+    // VL53L1_copy_sys_and_core_results_to_range_results() end
+
+    // set range_status in ranging_data based on value of RESULT__RANGE_STATUS
+    // register mostly based on ConvertStatusLite()
+    match results.range_status {
+        17 | 2 | 1 | 3 => {
+            // MULTCLIPFAIL
+            // VCSELWATCHDOGTESTFAILURE
+            // VCSELCONTINUITYTESTFAILURE
+            // NOVHVVALUEFOUND
+            // from SetSimpleData()
+            ranging_data.range_status = RangeStatus::HardwareFail;
+        }
+
+        13 => {
+            // USERROICLIP
+            // from SetSimpleData()
+            ranging_data.range_status = RangeStatus::MinRangeFail;
+        }
+
+        18 => {
+            // GPHSTREAMCOUNT0READY
+            ranging_data.range_status = RangeStatus::SynchronizationInt;
+        }
+
+        5 => {
+            // RANGEPHASECHECK
+            ranging_data.range_status = RangeStatus::OutOfBoundsFail;
+        }
+
+        4 => {
+            // MSRCNOTARGET
+            ranging_data.range_status = RangeStatus::SignalFail;
+        }
+
+        6 => {
+            // SIGMATHRESHOLDCHECK
+            ranging_data.range_status = RangeStatus::SigmaFail;
+        }
+
+        7 => {
+            // PHASECONSISTENCY
+            ranging_data.range_status = RangeStatus::WrapTargetFail;
+        }
+
+        12 => {
+            // RANGEIGNORETHRESHOLD
+            ranging_data.range_status = RangeStatus::XtalkSignalFail;
+        }
+
+        8 => {
+            // MINCLIP
+            ranging_data.range_status = RangeStatus::RangeValidMinRangeClipped;
+        }
+
+        9 => {
+            // RANGECOMPLETE
+            // from VL53L1_copy_sys_and_core_results_to_range_results()
+            if results.stream_count == 0 {
+                ranging_data.range_status = RangeStatus::RangeValidNoWrapCheckFail;
+            } else {
+                ranging_data.range_status = RangeStatus::RangeValid;
+            }
+        }
+
+        _ => {
+            ranging_data.range_status = RangeStatus::None;
+        }
+    }
+
+    // from SetSimpleData()
+    ranging_data.peak_signal_count_rate_mcps =
+        count_rate_fixed_to_float(results.peak_signal_count_rate_crosstalk_corrected_mcps_sd0);
+    ranging_data.ambient_count_rate_mcps =
+        count_rate_fixed_to_float(results.ambient_count_rate_mcps_sd0);
+
+    ranging_data
 }
