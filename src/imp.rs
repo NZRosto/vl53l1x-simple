@@ -1,4 +1,4 @@
-use crate::{reg::Register, ClockSource, InitialisationError, Vl53l1x};
+use crate::{reg::Register, InitialisationError, Vl53l1x};
 
 #[allow(dead_code)]
 pub(crate) enum DistanceMode {
@@ -100,7 +100,7 @@ where
 {
     pub(crate) fn init(
         &mut self,
-        timer: &impl ClockSource,
+        delay: &mut impl embedded_hal::delay::DelayNs,
     ) -> Result<(), InitialisationError<EI2C, EX>> {
         // check model ID and module type registers (values specified in datasheet)
         let model_id = self
@@ -114,35 +114,25 @@ where
 
         self.write(Register::SoftReset as u16, 0x00)
             .map_err(InitialisationError::I2C)?;
-        {
-            let current_time = timer.get_ms();
-            while timer.get_ms() - current_time < 1 {}
-        }
+        delay.delay_ms(1);
         self.write(Register::SoftReset as u16, 0x01)
             .map_err(InitialisationError::I2C)?;
 
         // give it some time to boot; otherwise the sensor NACKs during the self.read()
         // call below and the Arduino 101 doesn't seem to handle that well
-        {
-            let current_time = timer.get_ms();
-            while timer.get_ms() - current_time < 1 {}
-        }
+        delay.delay_ms(1);
 
         // VL53L1_poll_for_boot_completion() begin
 
         // check last_status in case we still get a NACK to try to deal with it
         // correctly
-        let current_time = timer.get_ms();
-        while (self
-            .read(Register::FirmwareSystemStatus as u16)
-            .map_err(InitialisationError::I2C)?
-            & 0x01)
-            == 0
-        {
-            if timer.get_ms() - current_time > 500 {
-                return Err(InitialisationError::BootCompletionTimeout);
-            }
-        }
+        poll_timeout(delay, 500, || {
+            Ok((self
+                .read(Register::FirmwareSystemStatus as u16)
+                .map_err(InitialisationError::I2C)?
+                & 0x01)
+                != 0)
+        })?;
 
         // VL53L1_poll_for_boot_completion() end
 
@@ -893,4 +883,25 @@ fn get_ranging_data(results: &ResultBuffer) -> RangingData {
         count_rate_fixed_to_float(results.ambient_count_rate_mcps_sd0);
 
     ranging_data
+}
+
+/// Poll a function until it returns true or a timeout is reached.
+fn poll_timeout<EI2C, EX>(
+    delay: &mut impl embedded_hal::delay::DelayNs,
+    timeout_ms: u32,
+    mut f: impl FnMut() -> Result<bool, InitialisationError<EI2C, EX>>,
+) -> Result<(), InitialisationError<EI2C, EX>> {
+    let mut counter = 0;
+    loop {
+        if f()? {
+            return Ok(());
+        }
+
+        if counter >= timeout_ms {
+            return Err(InitialisationError::Timeout);
+        }
+
+        delay.delay_ms(1);
+        counter += 1;
+    }
 }

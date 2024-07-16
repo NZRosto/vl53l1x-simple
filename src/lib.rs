@@ -17,16 +17,10 @@ pub enum InitialisationError<EI2C, EX> {
 
     /// The model ID read from the device was invalid.
     InvalidModelId(u16),
-    /// The device failed to boot within a reasonable time.
-    BootCompletionTimeout,
+    /// The device timed out.
+    Timeout,
     /// The timing budget was invalid.
     InvalidTimingBudget,
-}
-
-/// A time source with millisecond precision.
-pub trait ClockSource {
-    /// Get the current time in milliseconds.
-    fn get_ms(&self) -> u32;
 }
 
 /// A VL53L1X driver. Use the `new` function to create a new instance, then
@@ -54,11 +48,6 @@ where
     /// `x_shut` pin to select the device to be reset, then it will change that
     /// devices' address to the provided address.
     ///
-    /// For calibration, a time source is needed to measure a timeout. Provide
-    /// an implementation of [`ClockSource`], this could be time since program
-    /// start, or a realtime clock. This is also used to provide small
-    /// delays, seeing as we already have a time source.
-    ///
     /// If these sensors are being used in an array, set all the xshut pins low
     /// prior to calling this function which will allow this to only initialize
     /// a single sensor.
@@ -70,19 +59,13 @@ where
         i2c: I2C,
         mut x_shut: X,
         address: u8,
-        timer: &impl ClockSource,
+        delay: &mut impl embedded_hal::delay::DelayNs,
     ) -> Result<Self, InitialisationError<EI2C, EX>> {
         // Reset the device by driving XSHUT low for 10ms.
         x_shut.set_low().map_err(InitialisationError::XShut)?;
-        {
-            let start_time = timer.get_ms();
-            while timer.get_ms() - start_time < 10 {} // Delay for 10ms.
-        }
+        delay.delay_ms(10);
         x_shut.set_high().map_err(InitialisationError::XShut)?;
-        {
-            let start_time = timer.get_ms();
-            while timer.get_ms() - start_time < 10 {} // Delay for 10ms.
-        }
+        delay.delay_ms(10);
 
         let mut this = Self {
             i2c,
@@ -97,7 +80,7 @@ where
             saved_vhv_timeout: 0,
         };
 
-        this.init(timer)?;
+        this.init(delay)?;
 
         this.set_address(address)
             .map_err(InitialisationError::I2C)?;
